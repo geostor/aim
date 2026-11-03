@@ -1,0 +1,347 @@
+#!/usr/bin/env bash
+# aim: run the network. With no arguments it opens the console; every console action
+# is also a subcommand, so it can be scripted. The work itself is done by aimserv,
+# aimbot and aimwatch.
+set -uo pipefail
+source "$(dirname "$0")/aim-env"
+mkdir -p "$AGENTS"
+
+usage() {
+  cat <<USAGE
+usage: aim                             open the console
+       aim start                       start the server (saves, then wipes, the last conversation)
+       aim stop                        stop all agents and the server
+       aim add <name> <role> <mission> [tools]
+                                       start an agent on a mission, with any extra
+                                       tools such as Write,Edit
+       aim team <mission>              start a mission's whole team
+       aim rm <name>                   stop an agent and sign it off
+       aim rm-mission <mission>        move a mission to $AIM_STATE/removed-missions
+       aim view <mission>              open the page a mission is building
+       aim watch                       follow the conversation
+       aim show <name>                 print what an agent has said, and its summary
+       aim status                      show the server and agents
+       aim list                        print each agent as tab-separated lines:
+                                       name, state, time of last message, last message
+       aim config                      print settings the console reads
+       aim protocol <mission>          print the team rules agents on a mission get
+
+Missions are folders in $AIM_MISSIONS.
+USAGE
+}
+
+err() { echo "aim: $*" >&2; return 1; }
+
+# True if the pid in file $1 is alive and its command matches $2. The command check
+# stops a recycled pid being mistaken for ours.
+pid_is() {
+  local pid
+  pid=$(cat "$1" 2>/dev/null) || return 1
+  [[ -n $pid ]] && ps -o command= -p "$pid" 2>/dev/null | grep -qE -- "$2"
+}
+
+server_running() { pid_is "$SERVER_PID" "/aimserv([[:space:]]|$)|/aim([[:space:]]|$)|-m aim\.server([[:space:]]|$)"; }
+agent_running() { pid_is "$AGENTS/$1.pid" "aimbot|${AIM_CLAUDE##*/}"; }
+
+# Run a command in the background in its own process group (set -m), so a Ctrl-C
+# in this terminal can't reach it. Sets $spawned to its pid.
+spawn() {
+  local log=$1 input=$2
+  shift 2
+  set -m
+  nohup "$@" <"$input" >"$log" 2>&1 &
+  spawned=$!
+  set +m
+}
+
+valid_name() {
+  [[ $1 =~ ^[A-Za-z][A-Za-z0-9_-]{1,31}$ ]] ||
+    err "invalid name '$1': use 2-32 letters, digits, - or _, starting with a letter"
+}
+
+mission_dir() {
+  [[ -n $1 && $1 != */* && -f $AIM_MISSIONS/$1/mission.md ]] || { err "no such mission: '$1'"; return 1; }
+  echo "$AIM_MISSIONS/$1"
+}
+
+# Each mission has one room, named after it.
+mission_room() { echo "#$1" | tr '[:upper:]' '[:lower:]'; }
+
+# The mission's team, comma-separated with the lead first, plus $2 if it isn't listed.
+mission_team() {
+  local team name
+  team=$(grep -v '^#' "$AIM_MISSIONS/$1/team.tsv" 2>/dev/null | cut -f1 | grep . | paste -sd, -) || true
+  case ",$team," in
+    *",$2,"*) ;;
+    *) team="${team:+$team,}$2" ;;
+  esac
+  echo "$team"
+}
+
+# Expire a screen name, so the server signs it off properly on its next request and
+# the name is free to use again. Only for names checked by valid_name.
+release_name() {
+  aim_sql "UPDATE aim.users SET last_seen = now() - interval '1 day'
+           WHERE lower(name) = lower('$1') AND signed_off IS NULL" >/dev/null 2>&1 || true
+}
+
+cmd_start() {
+  if server_running; then
+    echo "Server is already running at $AIM_URL"
+    return 0
+  fi
+  echo "Starting the server..."
+  spawn "$SERVER_LOG" /dev/null "$ROOT/bin/aimserv"
+  local pid=$spawned
+  echo "$pid" >"$SERVER_PID"
+  rm -f "${AGENTS:?}"/*.pid
+  for _ in {1..240}; do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      rm -f "${SERVER_PID:?}"
+      tail -2 "$SERVER_LOG" >&2
+      err "the server failed to start; its log is $SERVER_LOG"
+      return 1
+    fi
+    if lsof -nP -a -p "$pid" -iTCP:"$AIM_PORT" -sTCP:LISTEN >/dev/null 2>&1; then
+      grep -h "saved the previous" "$SERVER_LOG" || true
+      echo "Server is running at $AIM_URL"
+      return 0
+    fi
+    sleep 0.25
+  done
+  kill "$pid" 2>/dev/null
+  rm -f "${SERVER_PID:?}"
+  err "the server didn't start listening; its log is $SERVER_LOG"
+}
+
+stop_agent() {
+  local name=$1 pid
+  if agent_running "$name"; then
+    pid=$(cat "$AGENTS/$name.pid")
+    kill "$pid" 2>/dev/null
+    for _ in {1..20}; do
+      kill -0 "$pid" 2>/dev/null || break
+      sleep 0.1
+    done
+    kill -9 "$pid" 2>/dev/null
+  fi
+  rm -f "${AGENTS:?}/$name.pid"
+}
+
+cmd_stop() {
+  local file pid
+  stop_camera
+  for file in "$AGENTS"/*.pid; do
+    [[ -e $file ]] && stop_agent "$(basename "$file" .pid)"
+  done
+  if server_running; then
+    pid=$(cat "$SERVER_PID")
+    kill "$pid" 2>/dev/null
+    for _ in {1..50}; do
+      kill -0 "$pid" 2>/dev/null || break
+      sleep 0.2
+    done
+    kill -9 "$pid" 2>/dev/null
+    echo "Server stopped."
+  else
+    echo "Server isn't running."
+  fi
+  rm -f "${SERVER_PID:?}"
+}
+
+cmd_add() {
+  [[ $# -eq 3 || $# -eq 4 ]] || { usage >&2; return 2; }
+  local name=$1 role=$2 extra=${4:-} dir
+  valid_name "$name" || return 1
+  dir=$(mission_dir "$3") || return 1
+  server_running || { err "the server isn't running; start it first"; return 1; }
+  agent_running "$name" && { err "$name is already running"; return 1; }
+  release_name "$name"
+  spawn "$AGENTS/$name.log" "$dir/mission.md" env "AIM_ROOM=$(mission_room "$3")" \
+    "AIM_TEAM=$(mission_team "$3" "$name")" "AIM_WORKDIR=$dir/output" \
+    "AIM_EXTRA_TOOLS=$extra" "$ROOT/bin/aimbot" "$name" "$role"
+  echo "$spawned" >"$AGENTS/$name.pid"
+  echo "Started $name (budget cap \$$AIM_BUDGET)."
+  start_camera "$3"
+}
+
+# If anyone on the mission can write files, keep a camera on what they make.
+start_camera() {
+  grep -v '^#' "$AIM_MISSIONS/$1/team.tsv" 2>/dev/null | cut -f3 | grep -q Write || return 0
+  pid_is "$AIM_STATE/camera.pid" "aim.shots|aimshot" && return 0
+  spawn "$AIM_STATE/camera.log" /dev/null "$ROOT/bin/aimshot" "$1"
+  echo "$spawned" >"$AIM_STATE/camera.pid"
+}
+
+stop_camera() {
+  if pid_is "$AIM_STATE/camera.pid" "aim.shots|aimshot"; then
+    kill "$(cat "$AIM_STATE/camera.pid")" 2>/dev/null
+  fi
+  rm -f "${AIM_STATE:?}/camera.pid"
+}
+
+cmd_team() {
+  [[ $# -eq 1 ]] || { usage >&2; return 2; }
+  local dir name role tools started=0
+  dir=$(mission_dir "$1") || return 1
+  [[ -f $dir/team.tsv ]] || { err "$dir has no team.tsv"; return 1; }
+  while IFS=$'\t' read -r name role tools || [[ -n $name ]]; do
+    case "$name" in ''|\#*) continue ;; esac
+    cmd_add "$name" "$role" "$1" "$tools"
+    started=1
+  done <"$dir/team.tsv"
+  [[ $started -eq 1 ]] || err "$dir/team.tsv has no agents in it"
+}
+
+cmd_rm() {
+  [[ $# -eq 1 ]] || { usage >&2; return 2; }
+  valid_name "$1" || return 1
+  [[ -e $AGENTS/$1.pid ]] || { err "no agent called $1"; return 1; }
+  stop_agent "$1"
+  release_name "$1"
+  echo "Removed $1."
+}
+
+# Show a mission's page, replacing any viewer that's already running.
+cmd_view() {
+  [[ $# -eq 1 ]] || { usage >&2; return 2; }
+  mission_dir "$1" >/dev/null || return 1
+  if pid_is "$AIM_STATE/view.pid" "aim.view|aimview"; then
+    kill "$(cat "$AIM_STATE/view.pid")" 2>/dev/null
+    for _ in {1..20}; do
+      lsof -nP -t -iTCP:"$AIM_VIEW_PORT" -sTCP:LISTEN >/dev/null 2>&1 || break
+      sleep 0.1
+    done
+  fi
+  spawn "$AIM_STATE/view.log" /dev/null "$ROOT/bin/aimview" "$1"
+  echo "$spawned" >"$AIM_STATE/view.pid"
+  sleep 0.3
+  if kill -0 "$spawned" 2>/dev/null; then
+    echo "Showing $1 at http://127.0.0.1:$AIM_VIEW_PORT/"
+  else
+    err "couldn't start the viewer: $(tail -1 "$AIM_STATE/view.log")"
+  fi
+}
+
+cmd_rm_mission() {
+  [[ $# -eq 1 ]] || { usage >&2; return 2; }
+  local dir kept="$AIM_STATE/removed-missions"
+  dir=$(mission_dir "$1") || return 1
+  mkdir -p "$kept"
+  kept="$kept/$1-$(date +%Y%m%d-%H%M%S)"
+  mv "$dir" "$kept" || { err "couldn't move $dir"; return 1; }
+  echo "Removed mission $1. It's kept in $kept."
+}
+
+cmd_watch() {
+  exec "$ROOT/bin/aimwatch"
+}
+
+cmd_show() {
+  [[ $# -eq 1 ]] || { usage >&2; return 2; }
+  valid_name "$1" || return 1
+  local log="$AGENTS/$1.log"
+  [[ -e $log ]] || { err "no agent called $1"; return 1; }
+  local lower messages
+  lower=$(echo "$1" | tr '[:upper:]' '[:lower:]')
+  messages=$("$ROOT/bin/aimwatch" -o 2>/dev/null |
+    awk -F'\t' -v n="$lower" '$2 == "message" && tolower($3) == n { print $1 "  " $4 "  " $5 }')
+  echo "--- What $1 has said ---"
+  echo "${messages:-Nothing yet.}"
+  echo
+  echo "--- $1's summary ---"
+  if [[ -s $log ]]; then
+    # Bots read untrusted web pages, so keep control characters off the terminal.
+    LC_ALL=C tr -d '\000-\010\013-\037\177' <"$log"
+  elif agent_running "$1"; then
+    echo "$1 is still running. Its summary appears here when it finishes."
+  else
+    echo "$1 finished with no summary."
+  fi
+}
+
+# Each agent as: name, state, time of its last message, last message (- if none).
+cmd_list() {
+  local file name state last offset messages
+  offset=$(date +%z)
+  offset="${offset:0:3}:${offset:3:2}"
+  messages=$(aim_sql "SELECT DISTINCT ON (lower(sender)) lower(sender),
+                        to_char(time AT TIME ZONE INTERVAL '$offset','HH24:MI:SS'),
+                        regexp_replace(text, '[[:cntrl:]]+', ' ', 'g')
+                      FROM aim.events WHERE kind = 'message'
+                      ORDER BY lower(sender), id DESC" 2>/dev/null) || messages=
+  for file in "$AGENTS"/*.pid; do
+    [[ -e $file ]] || continue
+    name=$(basename "$file" .pid)
+    state=finished
+    agent_running "$name" && state=running
+    last=$(awk -F'\t' -v n="$(echo "$name" | tr '[:upper:]' '[:lower:]')" \
+      '$1 == n { print $2 "\t" $3 }' <<<"$messages")
+    printf '%s\t%s\t%s\n' "$name" "$state" "${last:-$(printf -- '-\t-')}"
+  done
+}
+
+# Print the agent list for people, cut to fit the terminal.
+show_agents() {
+  local name state time text line width
+  width=$(tput cols 2>/dev/null || echo 100)
+  while IFS=$'\t' read -r name state time text; do
+    line="$name: $state"
+    if [[ $text == - ]]; then
+      line+="  (no messages yet)"
+    else
+      line+="  $time  $text"
+    fi
+    line="  $line"
+    if [[ -t 1 && ${#line} -gt $width ]]; then
+      line="${line:0:$((width - 3))}..."
+    fi
+    echo "$line"
+  done < <(cmd_list)
+}
+
+cmd_status() {
+  if server_running; then
+    echo "Server: running at $AIM_URL"
+  else
+    echo "Server: stopped"
+  fi
+  if ls "$AGENTS"/*.pid >/dev/null 2>&1; then
+    echo "Agents:"
+    show_agents
+  else
+    echo "Agents: none"
+  fi
+}
+
+cmd_config() {
+  printf 'budget=%s\nmissions=%s\nstate=%s\nurl=%s\nprotocol=%s\n' \
+    "$AIM_BUDGET" "$AIM_MISSIONS" "$AIM_STATE" "$AIM_URL" "$AIM_PROTOCOL"
+}
+
+cmd_protocol() {
+  [[ $# -eq 1 ]] || { usage >&2; return 2; }
+  mission_dir "$1" >/dev/null || return 1
+  local team text
+  team=$(mission_team "$1" "")
+  team=${team%,}
+  text=$(cat "$AIM_PROTOCOL")
+  text=${text//\{room\}/$(mission_room "$1")}
+  text=${text//\{team\}/${team//,/, }}
+  text=${text//\{lead\}/${team%%,*}}
+  text=${text//\{name\}/each agent\'s own name}
+  echo "$text"
+}
+
+console() {
+  [[ -x $ROOT/.venv/bin/python ]] || (cd "$ROOT" && uv sync --quiet)
+  PYTHONPATH="$ROOT/src" exec "$ROOT/.venv/bin/python" -m aim.ui
+}
+
+case "${1:-}" in
+  '') console ;;
+  start|stop|add|team|rm|watch|show|status|list|config|protocol|view) cmd=$1; shift; "cmd_$cmd" "$@" ;;
+  rm-mission) shift; cmd_rm_mission "$@" ;;
+  help|-h|--help) usage ;;
+  *) usage >&2; exit 2 ;;
+esac

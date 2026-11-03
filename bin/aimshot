@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# aimshot <mission>: in the foreground, photograph the mission's page each time it's
+# saved, and tell its room. Installs the browser the first time it's needed.
+set -euo pipefail
+source "$(dirname "$0")/aim-env"
+
+[[ $# -eq 1 ]] || { echo "usage: aimshot <mission>" >&2; exit 2; }
+[[ $1 != */* && -f $AIM_MISSIONS/$1/mission.md ]] || die "no such mission: '$1'"
+[[ -x $ROOT/.venv/bin/python ]] || (cd "$ROOT" && uv sync --quiet)
+"$ROOT/.venv/bin/python" -m playwright install chromium >/dev/null
+room=$(echo "#$1" | tr '[:upper:]' '[:lower:]')
+PYTHONPATH="$ROOT/src" exec "$ROOT/.venv/bin/python" -m aim.shots \
+  "$AIM_MISSIONS/$1/output/index.html" "$AIM_URL" "$room"

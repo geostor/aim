@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# aimbot <name> <role> < mission: run one bot in the foreground. The mission comes
+# from stdin and the bot's final answer goes to stdout. The team rules in protocol.md
+# are added to the prompt, using AIM_ROOM and AIM_TEAM (comma-separated, lead first).
+# While it runs, new messages are pushed straight into the agent (see bot.py).
+# With AIM_WORKDIR, the agent can read files there and nowhere else, and AIM_EXTRA_TOOLS
+# adds tools such as Write,Edit.
+set -euo pipefail
+source "$(dirname "$0")/aim-env"
+
+usage="usage: aimbot <name> <role> < mission.md"
+[[ $# -eq 2 ]] || { echo "$usage" >&2; exit 2; }
+[[ ! -t 0 ]] || { echo "$usage" >&2; exit 2; }
+mission=$(cat)
+[[ -n $mission ]] || die "the mission on stdin is empty"
+
+room=${AIM_ROOM:-#lobby}
+team=${AIM_TEAM:-$1}
+lead=${team%%,*}
+protocol=$(cat "$AIM_PROTOCOL")
+protocol=${protocol//\{name\}/$1}
+protocol=${protocol//\{room\}/$room}
+protocol=${protocol//\{team\}/${team//,/, }}
+protocol=${protocol//\{lead\}/$lead}
+
+[[ -x $ROOT/.venv/bin/python ]] || (cd "$ROOT" && uv sync --quiet)
+
+tools=$AIM_TOOLS
+confine=()
+if [[ -n ${AIM_WORKDIR:-} ]]; then
+  mkdir -p "$AIM_WORKDIR"
+  cd "$AIM_WORKDIR"
+  tools="${tools:+$tools,}Read,Grep,Glob${AIM_EXTRA_TOOLS:+,$AIM_EXTRA_TOOLS}"
+  confine=(--restricted)  # file tools stay inside this folder, and no shell
+fi
+
+PYTHONPATH="$ROOT/src" exec "$ROOT/.venv/bin/python" -m aim.bot \
+  "$1" "$lead" "postgresql://aim:aim@127.0.0.1:$AIM_DB_PORT/$AIM_DB" -- \
+  "$AIM_CLAUDE" -p \
+  --input-format stream-json --output-format stream-json --verbose \
+  --model "$AIM_MODEL" \
+  --system-prompt "You are an AI agent working with a small team over group chat. Keep messages short and specific." \
+  ${confine[@]+"${confine[@]}"} \
+  --tools "$tools" \
+  --strict-mcp-config \
+  --mcp-config "{\"mcpServers\":{\"aim\":{\"type\":\"http\",\"url\":\"$AIM_URL\"}}}" \
+  --allowedTools "mcp__aim${tools:+,$tools}" \
+  --max-budget-usd "$AIM_BUDGET" \
+  <<<"$mission
+
+You are $1. $2
+
+$protocol"

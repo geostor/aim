@@ -1,0 +1,34 @@
+# Shared settings, sourced by aimserv, aimbot and aimwatch. Override with env vars.
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+
+: "${AIM_PORT:=8000}"
+: "${AIM_DB:=aim}"
+: "${AIM_CONTAINER:=aim-postgres}"
+: "${AIM_DB_PORT:=5434}"
+: "${AIM_RUNS:=$ROOT/runs}"             # where aimserv saves old conversations
+: "${AIM_MODEL:=sonnet}"
+: "${AIM_BUDGET:=2}"                    # dollars per bot
+: "${AIM_TOOLS=WebSearch,WebFetch}"     # set empty for chat-only bots
+: "${AIM_CLAUDE:=claude}"
+
+AIM_URL="http://127.0.0.1:$AIM_PORT/mcp"
+
+die() { echo "${0##*/}: $*" >&2; exit 1; }
+
+# Retries, because talking to the container occasionally fails for a moment.
+aim_sql() {
+  local attempt
+  for attempt in 1 2 3; do
+    podman exec "$AIM_CONTAINER" psql -U aim -d "$AIM_DB" -At -F $'\t' -v ON_ERROR_STOP=1 -c "$1" && return 0
+    sleep 0.3
+  done
+  return 1
+}
+
+: "${AIM_STATE:=$ROOT/.aim}"            # pid files and logs for what `aim` started
+: "${AIM_MISSIONS:=$ROOT/missions}"
+: "${AIM_VIEW_PORT:=8100}"                 # where aimview serves a mission's page
+: "${AIM_PROTOCOL:=$ROOT/protocol.md}"     # team rules given to every agent
+SERVER_PID="$AIM_STATE/server.pid"
+SERVER_LOG="$AIM_STATE/server.log"
+AGENTS="$AIM_STATE/agents"

@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# aimwatch [-o]: print the conversation so far, then follow it. -o prints once and
+# exits. One tab-separated event per line: time, kind, from, to-or-room, text.
+# Control characters in bot text are removed, so it can't drive your terminal or
+# break the columns.
+set -euo pipefail
+source "$(dirname "$0")/aim-env"
+
+once=0
+while getopts "o" opt; do
+  case $opt in
+    o) once=1 ;;
+    *) echo "usage: aimwatch [-o]" >&2; exit 2 ;;
+  esac
+done
+
+offset=$(date +%z)
+offset="${offset:0:3}:${offset:3:2}"
+last=0
+
+while true; do
+  # Started by the console: stop if it has gone, even if it was killed outright.
+  if [[ -n ${AIM_WATCH_PARENT:-} ]] && ! kill -0 "$AIM_WATCH_PARENT" 2>/dev/null; then
+    exit 0
+  fi
+  if max=$(aim_sql "SELECT coalesce(max(id),0) FROM aim.events" 2>/dev/null); then
+    if (( max < last )); then
+      echo "aimwatch: the server restarted and wiped the database" >&2
+      last=0
+    fi
+    if (( max > last )); then
+      rows=$(aim_sql "SELECT to_char(time AT TIME ZONE INTERVAL '$offset','HH24:MI:SS'), kind, sender,
+                             coalesce(recipient, room),
+                             regexp_replace(text, '[[:cntrl:]]+', ' ', 'g')
+                      FROM aim.events WHERE id > $last AND id <= $max ORDER BY id")
+      printf '%s\n' "$rows"
+      last=$max
+    fi
+  elif (( once )); then
+    die "can't read the database; is aimserv running?"
+  fi
+  (( once )) && exit 0
+  sleep 1
+done

@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# aimserv: run the server in the foreground; Ctrl-C stops it. Starts Postgres if
+# needed. Starting wipes the database, so the old conversation is saved first.
+set -euo pipefail
+source "$(dirname "$0")/aim-env"
+
+holder=$(lsof -nP -t -iTCP:"$AIM_PORT" -sTCP:LISTEN 2>/dev/null | head -1 || true)
+if [[ -n $holder ]]; then
+  die "port $AIM_PORT is in use by pid $holder: $(ps -o command= -p "$holder" | cut -c1-80)"
+fi
+
+if podman container exists "$AIM_CONTAINER"; then
+  podman start "$AIM_CONTAINER" >/dev/null
+else
+  podman run -d --name "$AIM_CONTAINER" -e POSTGRES_USER=aim -e POSTGRES_PASSWORD=aim \
+    -e POSTGRES_DB=aim -p "127.0.0.1:$AIM_DB_PORT:5432" docker.io/library/postgres:17-alpine >/dev/null
+fi
+for _ in {1..60}; do
+  podman exec "$AIM_CONTAINER" pg_isready -U aim -q && break
+  sleep 0.5
+done
+podman exec "$AIM_CONTAINER" pg_isready -U aim -q || die "Postgres didn't become ready"
+
+saved=$("$ROOT/bin/aimwatch" -o 2>/dev/null || true)
+if [[ -n $saved ]]; then
+  mkdir -p "$AIM_RUNS"
+  file="$AIM_RUNS/$(date +%Y%m%d-%H%M%S).tsv"
+  printf '%s\n' "$saved" >"$file"
+  echo "aimserv: saved the previous conversation to $file" >&2
+fi
+
+(cd "$ROOT" && uv sync --quiet)
+export DATABASE_URL="postgresql://aim:aim@127.0.0.1:$AIM_DB_PORT/$AIM_DB"
+exec "$ROOT/.venv/bin/aim" --port "$AIM_PORT"

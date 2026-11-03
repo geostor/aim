@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# aimview <mission>: serve the page a mission's team is building, in the foreground,
+# and open it in your browser. It refreshes whenever the file is saved.
+set -euo pipefail
+source "$(dirname "$0")/aim-env"
+
+[[ $# -eq 1 ]] || { echo "usage: aimview <mission>" >&2; exit 2; }
+[[ $1 != */* && -f $AIM_MISSIONS/$1/mission.md ]] || die "no such mission: '$1'"
+page="$AIM_MISSIONS/$1/output/index.html"
+url="http://127.0.0.1:$AIM_VIEW_PORT/"
+
+holder=$(lsof -nP -t -iTCP:"$AIM_VIEW_PORT" -sTCP:LISTEN 2>/dev/null | head -1 || true)
+[[ -z $holder ]] || die "port $AIM_VIEW_PORT is in use by pid $holder"
+
+[[ -n ${AIM_VIEW_NO_OPEN:-} ]] || (sleep 0.5; open "$url" 2>/dev/null || true) &
+[[ -x $ROOT/.venv/bin/python ]] || (cd "$ROOT" && uv sync --quiet)
+PYTHONPATH="$ROOT/src" exec "$ROOT/.venv/bin/python" -m aim.view "$page" "$AIM_VIEW_PORT"
